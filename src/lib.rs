@@ -3,7 +3,7 @@ extern crate log;
 
 use futures::future::join_all;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -31,7 +31,7 @@ type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, Error>;
 
 type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
-type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
+type TcpWriter = tokio::net::tcp::OwnedWriteHalf;
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
@@ -39,7 +39,7 @@ fn frame_size(frame: &[u8]) -> Result<usize> {
 
 fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
     let (reader, writer) = stream.into_split();
-    (BufReader::new(reader), BufWriter::new(writer))
+    (BufReader::new(reader), writer)
 }
 
 async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
@@ -108,8 +108,19 @@ impl Device {
     async fn raw_write_read(&mut self, frame: &Frame) -> Result<Frame> {
         let (reader, writer) = self.stream.as_mut().ok_or("no modbus connection")?;
         writer.write_all(&frame).await?;
-        writer.flush().await?;
-        read_frame(reader).await
+        // No flush needed for TcpStream half
+        let request_id = &frame[0..2];
+        let timeout = std::time::Duration::from_secs(5);
+        let reply = tokio::time::timeout(timeout, read_frame(reader)).await??;
+        if &reply[0..2] != request_id {
+            return Err(format!(
+                "transaction ID mismatch: expected {:?}, got {:?}",
+                request_id,
+                &reply[0..2]
+            )
+            .into());
+        }
+        Ok(reply)
     }
 
     async fn write_read(&mut self, frame: &Frame) -> Result<Frame> {
@@ -135,9 +146,8 @@ impl Device {
         let reply = self.write_read(&frame).await?;
         info!("modbus reply {}: {} bytes", self.url, reply.len());
         debug!("modbus reply {}: {:?}", self.url, &reply[..]);
-        channel
-            .send(reply)
-            .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
+        let _ = channel.send(reply);
+        Ok(())
     }
 
     async fn run(&mut self, channel: &mut ChannelRx) {
@@ -217,8 +227,8 @@ impl Bridge {
         while let Ok(buf) = read_frame(&mut reader).await {
             let (tx, rx) = oneshot::channel();
             channel.send(Message::Packet(buf, tx)).await?;
-            writer.write_all(&rx.await?).await?;
-            writer.flush().await?;
+            let reply = rx.await?;
+            writer.write_all(&reply).await?;
         }
         Ok(())
     }
@@ -245,11 +255,19 @@ impl Server {
 
         #[cfg(unix)]
         let mut sigterm = signal(SignalKind::terminate()).unwrap();
+
         tokio::select! {
             _ = join_all(tasks) => debug!("All tasks finished"),
             _ = tokio::signal::ctrl_c() => debug!("Received Ctrl+C"),
-            //#[cfg(unix)]
-            _ = sigterm.recv() => debug!("Received SIGTERM"),
+            _ = async {
+                #[cfg(unix)]
+                {
+                    sigterm.recv().await;
+                    debug!("Received SIGTERM");
+                }
+                #[cfg(not(unix))]
+                futures::future::pending::<()>().await
+            } => {},
         }
 
         info!("Shutting down");
@@ -257,5 +275,155 @@ impl Server {
 
     pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
         Ok(Self::new(config_file)?.run().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_frame_size_logic() {
+        let valid_header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x05];
+        assert_eq!(frame_size(&valid_header).unwrap(), 5);
+        
+        let large_header = [0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF];
+        assert_eq!(frame_size(&large_header).unwrap(), 65535);
+    }
+
+    #[tokio::test]
+    async fn test_transaction_id_mismatch() {
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _peer_addr) = mock_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 12];
+            let _ = stream.read_exact(&mut buf).await;
+
+            // Send reply with a WRONG transaction ID (0x99, 0x99) instead of (0x00, 0x01)
+            let wrong_reply: Frame = vec![0x99, 0x99, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00];
+            let _ = stream.write_all(&wrong_reply).await;
+        });
+
+        let mut device = Device::new(&addr.to_string());
+        device.connect().await.unwrap();
+
+        // Request with transaction ID 0x00 0x01
+        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+        
+        let result = device.raw_write_read(&request_frame).await;
+        
+        if result.is_err() {
+            let err_msg = result.err().unwrap().to_string();
+            assert!(err_msg.contains("transaction ID mismatch"), "Incorrect err: {}", err_msg);
+        } else {
+            panic!("Expected an error, but got success: {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_valid_transaction_id() {
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 12];
+            let _ = stream.read_exact(&mut buf).await;
+
+            // Send reply with CORRECT transaction ID (0x00, 0x01)
+            let valid_reply: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00];
+            let _ = stream.write_all(&valid_reply).await;
+        });
+
+        let mut device = Device::new(&addr.to_string());
+        device.connect().await.unwrap();
+
+        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+        
+        let result = device.raw_write_read(&request_frame).await;
+        assert!(result.is_ok(), "Expected success, got {:?}", result);
+        let reply = result.unwrap();
+        assert_eq!(reply[0..2], request_frame[0..2]);
+    }
+
+    #[tokio::test]
+    async fn test_backend_timeout() {
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 12];
+            let _ = stream.read_exact(&mut buf).await;
+            
+            // Hang indefinitely instead of replying
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        });
+
+        let mut device = Device::new(&addr.to_string());
+        device.connect().await.unwrap();
+
+        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+        
+        let start_time = std::time::Instant::now();
+        let result = device.raw_write_read(&request_frame).await;
+        let elapsed = start_time.elapsed();
+        
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("deadline has elapsed") || err_msg.contains("timeout"), "Got msg: {}", err_msg);
+        assert!(elapsed.as_secs() >= 4, "Should have taken 5s timeout");
+    }
+
+    #[tokio::test]
+    async fn test_multiplex_concurrency() {
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock_listener.local_addr().unwrap();
+
+        // The Mock Server simulates the single persistent Modbus backend
+        tokio::spawn(async move {
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
+            // We expect two requests multiplexed onto this same connection
+            for _ in 0..2 {
+                let mut buf = vec![0u8; 12];
+                // Read a complete 12-byte Modbus request
+                let _ = stream.read_exact(&mut buf).await;
+                // Simply echo it back (simulating a matched transaction ID)
+                let _ = stream.write_all(&buf).await;
+            }
+        });
+
+        // Launch the internal device channel multiplexer 
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);
+        tokio::spawn(async move {
+            Device::launch(&addr.to_string(), &mut rx).await;
+        });
+
+        // Client 1 sends a request with Transaction ID (0x00, 0x01)
+        let tx1 = tx.clone();
+        let client1 = tokio::spawn(async move {
+            let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx1.send(Message::Packet(request_frame, reply_tx)).await.unwrap();
+            let reply = reply_rx.await.unwrap();
+            assert_eq!(reply[0..2], [0x00, 0x01], "Client 1 got wrong Transaction ID");
+        });
+
+        // Client 2 concurrently sends a request with Transaction ID (0x00, 0x02)
+        let tx2 = tx.clone();
+        let client2 = tokio::spawn(async move {
+            let request_frame: Frame = vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx2.send(Message::Packet(request_frame, reply_tx)).await.unwrap();
+            let reply = reply_rx.await.unwrap();
+            assert_eq!(reply[0..2], [0x00, 0x02], "Client 2 got wrong Transaction ID");
+        });
+
+        // Join both client tasks; they should both smoothly succeed 
+        // through the exact same backend device connection 
+        tokio::try_join!(client1, client2).unwrap();
     }
 }
