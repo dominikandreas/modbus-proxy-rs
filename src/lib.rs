@@ -85,13 +85,14 @@ impl Device {
     async fn connect(&mut self) -> Result<()> {
         match create_connection(&self.url).await {
             Ok(connection) => {
-                info!("modbus connection to {} sucessfull", self.url);
+                info!("modbus connection to {} successful", self.url);
+                debug!("Established backend TCP connection to {}", self.url);
                 self.stream = Some(connection);
                 Ok(())
             }
             Err(error) => {
                 self.stream = None;
-                info!("modbus connection to {} error: {} ", self.url, error);
+                warn!("modbus connection to {} error: {} ", self.url, error);
                 Err(error)
             }
         }
@@ -107,11 +108,13 @@ impl Device {
 
     async fn raw_write_read(&mut self, frame: &Frame) -> Result<Frame> {
         let (reader, writer) = self.stream.as_mut().ok_or("no modbus connection")?;
+        trace!("Writing {} bytes to backend {}: {:02X?}", frame.len(), self.url, frame);
         writer.write_all(&frame).await?;
         // No flush needed for TcpStream half
         let request_id = &frame[0..2];
         let timeout = std::time::Duration::from_secs(5);
         let reply = tokio::time::timeout(timeout, read_frame(reader)).await??;
+        trace!("Read {} bytes from backend {}: {:02X?}", reply.len(), self.url, reply);
         if &reply[0..2] != request_id {
             return Err(format!(
                 "transaction ID mismatch: expected {:?}, got {:?}",
@@ -141,11 +144,11 @@ impl Device {
     }
 
     async fn handle_packet(&mut self, frame: Frame, channel: ReplySender) -> Result<()> {
-        info!("modbus request {}: {} bytes", self.url, frame.len());
-        debug!("modbus request {}: {:?}", self.url, &frame[..]);
+        info!("modbus request to {}: {} bytes", self.url, frame.len());
+        debug!("modbus request to {}: {:02X?}", self.url, &frame[..]);
         let reply = self.write_read(&frame).await?;
-        info!("modbus reply {}: {} bytes", self.url, reply.len());
-        debug!("modbus reply {}: {:?}", self.url, &reply[..]);
+        info!("modbus reply from {}: {} bytes", self.url, reply.len());
+        debug!("modbus reply from {}: {:02X?}", self.url, &reply[..]);
         let _ = channel.send(reply);
         Ok(())
     }
@@ -201,7 +204,8 @@ impl Bridge {
             &self.listen.bind, &self.modbus.url
         );
         loop {
-            let (client, _) = listener.accept().await.unwrap();
+            let (client, addr) = listener.accept().await.unwrap();
+            info!("Accepted client connection from {}", addr);
             let tx = tx.clone();
             tokio::spawn(async move {
                 if let Err(err) = Self::handle_client(client, tx).await {
@@ -212,22 +216,31 @@ impl Bridge {
     }
 
     async fn handle_client(client: TcpStream, channel: ChannelTx) -> Result<()> {
+        let peer_addr = client
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        debug!("Client {} stream setup", peer_addr);
         client.set_nodelay(true)?;
         channel.send(Message::Connection).await?;
 
-        let result = Self::client_loop(client, &channel).await;
+        let result = Self::client_loop(client, &channel, &peer_addr).await;
 
         channel.send(Message::Disconnection).await?;
+        info!("Client {} disconnected", peer_addr);
 
         result
     }
 
-    async fn client_loop(client: TcpStream, channel: &ChannelTx) -> Result<()> {
+    async fn client_loop(client: TcpStream, channel: &ChannelTx, peer_addr: &str) -> Result<()> {
         let (mut reader, mut writer) = split_connection(client);
         while let Ok(buf) = read_frame(&mut reader).await {
+            debug!("Received request from client {}: {:02X?} ({} bytes)", peer_addr, &buf[..], buf.len());
             let (tx, rx) = oneshot::channel();
             channel.send(Message::Packet(buf, tx)).await?;
             let reply = rx.await?;
+            debug!("Sending reply to client {}: {:02X?} ({} bytes)", peer_addr, &reply[..], reply.len());
             writer.write_all(&reply).await?;
         }
         Ok(())
