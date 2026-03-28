@@ -43,7 +43,15 @@ devices:
 - modbus:
     url: plc1.acme.org:502     # device url (mandatory)
   listen:
-    bind: 0:9000               # listening address (mandatory)
+    bind: 0.0.0.0:9000         # listening address (mandatory)
+```
+
+Or in TOML:
+
+```toml
+[[devices]]
+modbus.url = "plc1.acme.org:502"
+listen.bind = "0.0.0.0:9000"
 ```
 
 Assuming you saved this file as `modbus-config.yml`, start the server with:
@@ -64,11 +72,11 @@ devices:
 - modbus:
     url: plc1.acme.org:502
   listen:
-    bind: 0:9000
+    bind: 0.0.0.0:9000
 - modbus:
     url: plc2.acme.org:502
   listen:
-    bind: 0:9001
+    bind: 0.0.0.0:9001
 ```
 
 ## Logging
@@ -97,7 +105,7 @@ devices:
 - modbus:
     url: plc1.acme.org:502
   listen:
-    bind: 0:502
+    bind: 0.0.0.0:502
 ```
 
 The supplied docker image by default runs the command `/modbus-proxy-rs -c /etc/modbus-proxy.yml`.
