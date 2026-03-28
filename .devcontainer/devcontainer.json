@@ -1,0 +1,36 @@
+{
+    "name": "Rust DevContainer (modbus-proxy-rs)",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    // Set *default* container specific settings.json values on container create.
+    "customizations": {
+        "vscode": {
+            // Add the IDs of extensions you want installed when the container is created.
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "vadimcn.vscode-lldb",
+                "tamasfe.even-better-toml",
+                "serayuzgur.crates",
+                "mutabbir.cargo-run"
+            ]
+        }
+    },
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // Assuming port 9000 as configured in the README example.
+    "forwardPorts": [
+        9000
+    ],
+    // Use 'postCreateCommand' to run commands after the container is created.
+    // "postCreateCommand": "rustc --version",
+    // Configure tool-specific properties.
+    "remoteUser": "vscode",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "configureZshAsDefaultShell": true,
+            "makeReadonly": false
+        }
+    }
+}
