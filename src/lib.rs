@@ -171,7 +171,8 @@ impl Device {
                     }
                 }
                 Message::Packet(frame, channel) => {
-                    if let Err(_) = self.handle_packet(frame, channel).await {
+                    if let Err(e) = self.handle_packet(frame, channel).await {
+                        error!("Backend error from {}: {}", self.url, e);
                         self.disconnect();
                     }
                 }
