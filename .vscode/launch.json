@@ -1,0 +1,48 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug (CodeLLDB)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=modbus-proxy-rs",
+                    "--package=modbus-proxy-rs"
+                ],
+                "filter": {
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--config-file",
+                "config.yml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "name": "Debug (Windows/MSVC)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/modbus-proxy-rs.exe",
+            "args": [
+                "--config-file",
+                "config.yml"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "RUST_LOG",
+                    "value": "debug"
+                }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "cargo build"
+        }
+    ]
+}
