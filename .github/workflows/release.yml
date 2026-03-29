@@ -4,16 +4,36 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu      # x64
-          - armv7-unknown-linux-gnueabihf # armv7l
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_name: modbus-proxy-rs-x86_64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_name: modbus-proxy-rs-aarch64-unknown-linux-gnu.tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            archive_name: modbus-proxy-rs-armv7-unknown-linux-gnueabihf.tar.gz
+            use_cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: modbus-proxy-rs-x86_64-pc-windows-msvc.zip
+            use_cross: false
 
     steps:
       - name: Checkout repository
@@ -25,20 +45,39 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install cross
+        if: ${{ matrix.use_cross }}
         uses: taiki-e/install-action@cross
 
-      - name: Build binary
+      - name: Build binary with cross
+        if: ${{ matrix.use_cross }}
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Rename binary for upload
-        run: |
-          mv target/${{ matrix.target }}/release/modbus-proxy-rs modbus-proxy-rs-${{ matrix.target }}
+      - name: Build binary with cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Upload Artifact
+      - name: Package Linux artifact
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/modbus-proxy-rs-${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/modbus-proxy-rs dist/modbus-proxy-rs-${{ matrix.target }}/modbus-proxy-rs
+          cp README.md LICENSE dist/modbus-proxy-rs-${{ matrix.target }}/
+          tar -C dist -czf "${{ matrix.archive_name }}" "modbus-proxy-rs-${{ matrix.target }}"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/modbus-proxy-rs-${{ matrix.target }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/modbus-proxy-rs.exe" "dist/modbus-proxy-rs-${{ matrix.target }}/modbus-proxy-rs.exe"
+          Copy-Item README.md, LICENSE "dist/modbus-proxy-rs-${{ matrix.target }}/"
+          Compress-Archive -Path "dist/modbus-proxy-rs-${{ matrix.target }}" -DestinationPath "${{ matrix.archive_name }}"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.target }}
-          path: modbus-proxy-rs-${{ matrix.target }}
+          name: release-${{ matrix.target }}
+          path: ${{ matrix.archive_name }}
 
   release:
     name: Create Release
@@ -55,13 +94,8 @@ jobs:
       - name: Prepare Release Assets
         run: |
           mkdir -p release_assets
-          # Move and rename x64 binary
-          mv artifacts/binary-x86_64-unknown-linux-gnu/modbus-proxy-rs-x86_64-unknown-linux-gnu release_assets/modbus-proxy-rs-x64-linux
-          # Move and rename armv7l binary
-          mv artifacts/binary-armv7-unknown-linux-gnueabihf/modbus-proxy-rs-armv7-unknown-linux-gnueabihf release_assets/modbus-proxy-rs-armv7l-linux
-          
-          # Ensure execution permissions
-          chmod +x release_assets/*
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release_assets/ \;
+          sha256sum release_assets/* > release_assets/SHA256SUMS.txt
 
       - name: Generate tag
         id: tag

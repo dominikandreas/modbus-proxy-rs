@@ -1,52 +1,63 @@
 # Modbus TCP proxy
 
-Many modbus devices support only one or very few clients. This proxy acts as a
-bridge between the client and the modbus device. It can be seen as a layer 7
-reverse proxy.
-This allows multiple clients to communicate with the same modbus device.
+This repo is a fork of [`tiagocoutinho/modbus-proxy-rs`](https://github.com/tiagocoutinho/modbus-proxy-rs) that I tried to improve purely via agentic coding (all gemini 3.1 pro medium thinking).
 
-When multiple clients are connected, cross messages are avoided by serializing
-communication on a first come first served REQ/REP basis.
+In particular, the agent changed the following:
 
-This project is the [Rust][rust] version of the [Python][python] based
-[modbus-proxy][modbus-proxy-py] project.
+- Safer proxying with transaction ID checks, backend timeouts, reconnects, and better error logging.
+- New Test Suite for mismatches, timeouts, and multiplexed concurrency.
+- More detailed connection and traffic logs.
+- Project polish: release workflow, and local devcontainer/editor setup, license
 
-I did it because it fitted my personal goal of exercising with the [Rust][rust]
-programming language and it's async based [tokio] library.
+`modbus-proxy-rs` is a Modbus TCP layer 7 reverse proxy. It lets multiple
+clients talk to Modbus devices that only support a single client, or a very
+small number of concurrent clients.
 
-The goal was to produce a robust, highly concurrent server with a low
-memory footprint.
 
-## Installation
+## Behavior
 
-```bash
-$ cargo install modbus-proxy-rs
-```
+- Multiple client connections can share one backend Modbus TCP connection per
+  configured device.
+- Requests to the same backend are serialized on a first-come, first-served
+  request/reply basis to avoid cross-talk between clients.
+- Backend connections are opened lazily, reused while clients are active, and
+  closed again when the last client disconnects.
+- Backend replies are validated against the request transaction ID before they
+  are forwarded to the client.
+- Backend reads use a 5 second timeout so a stalled device does not block the
+  proxy forever.
+- Backend errors are logged and the proxy reconnects on the next request.
+- Multiple configured devices run concurrently, each with its own listener and
+  backend connection state.
 
-## Running the server
+Compared with the upstream Rust fork, this branch also adds more detailed
+connection and traffic logging, async tests for the proxy behavior above, a
+license, release automation, and local development container/editor setup.
 
-First, you will need write a configuration file where you specify for each
-modbus device you which to control:
 
-* modbus connection (the modbus device url)
-* listen interface (to which url your clients should connect)
+## Configuration
 
-Configuration files can be written in YAML (*.yml* or *.yaml*) or
-TOML (*.toml*).
+The proxy reads its configuration from a file passed with `-c` /
+`--config-file`.
 
-Suppose you have a PLC modbus device listening on *plc1.acme.org:502* and
-you want your clients to connect to your machine on port 9000. A YAML
-configuration would look like this:
+Each device entry needs:
+
+- `modbus.url`: the backend Modbus TCP device address
+- `listen.bind`: the local listening address clients should connect to
+
+Configuration files can be written in YAML, TOML, or JSON.
+
+Example in YAML:
 
 ```yaml
 devices:
-- modbus:
-    url: plc1.acme.org:502     # device url (mandatory)
-  listen:
-    bind: 0.0.0.0:9000         # listening address (mandatory)
+  - modbus:
+      url: plc1.acme.org:502
+    listen:
+      bind: 0.0.0.0:9000
 ```
 
-Or in TOML:
+Example in TOML:
 
 ```toml
 [[devices]]
@@ -54,91 +65,178 @@ modbus.url = "plc1.acme.org:502"
 listen.bind = "0.0.0.0:9000"
 ```
 
-Assuming you saved this file as `modbus-config.yml`, start the server with:
+Example in JSON:
 
-```bash
-$ modbus-proxy-rs -c ./modbus-config.yml
+```json
+{
+  "devices": [
+    {
+      "modbus": { "url": "plc1.acme.org:502" },
+      "listen": { "bind": "0.0.0.0:9000" }
+    }
+  ]
+}
 ```
 
-Now, instead of connecting your client(s) to `plc1.acme.org:502` you just need to
-tell them to connect to `*machine*:9000` (where *machine* is the host where
-modbus-proxy is running).
-
-Note that the server is capable of handling multiple modbus devices. Here is a
-configuration example for 2 devices:
+You can expose more than one backend by adding more entries:
 
 ```yaml
 devices:
-- modbus:
-    url: plc1.acme.org:502
-  listen:
-    bind: 0.0.0.0:9000
-- modbus:
-    url: plc2.acme.org:502
-  listen:
-    bind: 0.0.0.0:9001
+  - modbus:
+      url: plc1.acme.org:502
+    listen:
+      bind: 0.0.0.0:9000
+  - modbus:
+      url: plc2.acme.org:502
+    listen:
+      bind: 0.0.0.0:9001
 ```
+
+## Installation
+
+### From GitHub releases
+
+Download the archive that matches your platform from the
+[latest release](https://github.com/dominikandreas/modbus-proxy-rs/releases/latest):
+
+- `modbus-proxy-rs-x86_64-pc-windows-msvc.zip`: 64-bit Windows
+- `modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz`: most 64-bit Linux systems
+- `modbus-proxy-rs-x86_64-unknown-linux-musl.tar.gz`: static 64-bit Linux build
+- `modbus-proxy-rs-aarch64-unknown-linux-gnu.tar.gz`: ARM64 Linux
+- `modbus-proxy-rs-armv7-unknown-linux-gnueabihf.tar.gz`: 32-bit ARM Linux
+
+Each release also includes `SHA256SUMS.txt` for checksum verification.
+
+On Linux:
+
+```bash
+tar -xzf modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz
+cd modbus-proxy-rs-x86_64-unknown-linux-gnu
+./modbus-proxy-rs -c ./modbus-config.yml
+```
+
+On Windows PowerShell:
+
+```powershell
+Expand-Archive .\modbus-proxy-rs-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd .\modbus-proxy-rs-x86_64-pc-windows-msvc
+.\modbus-proxy-rs.exe -c .\modbus-config.yml
+```
+
+
+### From source
+
+Installation requires the Rust toolchain.
+
+Install from crates.io:
+
+```bash
+cargo install modbus-proxy-rs
+```
+
+Or build locally:
+
+```bash
+cargo build --release
+```
+
+
+## Running
+
+Start the proxy with:
+
+```bash
+modbus-proxy-rs -c ./modbus-config.yml
+```
+
+Clients should then connect to the configured `listen.bind` address instead of
+directly to the Modbus device.
+
+The server shuts down cleanly on `Ctrl+C`, and on Unix also reacts to
+`SIGTERM`.
 
 ## Logging
 
-Log levels can be adjusted by setting the `RUST_LOG` environment variable (default is `warn`):
+Logging is controlled with `RUST_LOG`.
 
 ```bash
-$ RUST_LOG=debug modbus-proxy-rs -c ./modbus-config.yml
+RUST_LOG=info modbus-proxy-rs -c ./modbus-config.yml
 ```
+
+Useful levels:
+
+- `warn`: backend connection problems and retries
+- `info`: client connect/disconnect events and request/reply sizes
+- `debug`: connection lifecycle and per-request frame dumps
+- `trace`: raw backend write/read frame dumps
 
 ## Docker
 
-This project ships with a [Dockerfile](./Dockerfile) which you can use as a
-base to launch modbus-proxy inside a docker container.
+This project ships with a [Dockerfile](./Dockerfile).
 
-First, build the docker image with:
+Build the image:
 
 ```bash
-$ docker build -t modbus-proxy .
+docker build -t modbus-proxy .
 ```
 
-Assuming you have prepared a `config.yml` in the current directory:
+The final image is a minimal `scratch` image that runs as a non-root user and
+starts with:
+
+```bash
+./modbus-proxy-rs -c /etc/modbus-proxy.yml
+```
+
+If you have a local `config.yml`:
 
 ```yaml
 devices:
-- modbus:
-    url: plc1.acme.org:502
-  listen:
-    bind: 0.0.0.0:502
+  - modbus:
+      url: plc1.acme.org:502
+    listen:
+      bind: 0.0.0.0:502
 ```
 
-The supplied docker image by default runs the command `/modbus-proxy-rs -c /etc/modbus-proxy.yml`.
-Therefore, running launching a container is as simple as:
+Run the container with:
 
 ```bash
 docker run --init --rm -p 5020:502 -v $PWD/config.yml:/etc/modbus-proxy.yml modbus-proxy
 ```
 
-You can supply a different configuration path (ex: `/config.yml`):
+Or pass a different configuration path:
 
 ```bash
 docker run --init --rm -p 5020:502 -v $PWD/config.yml:/config.yml modbus-proxy -c /config.yml
 ```
 
-Now you should be able to access your modbus device through the modbus-proxy by
-connecting your client(s) to `<your-hostname/ip>:5020`.
+Clients can then connect to `<your-hostname-or-ip>:5020`.
 
-Note that for each modbus device you add in the configuration file you need
-to publish the corresponding bind port on the host
-(`-p <host port>:<container port>` argument).
+If you configure multiple devices, publish each corresponding bind port with an
+additional `-p <host port>:<container port>` mapping.
+
+## Development
+
+Run the test suite with:
+
+```bash
+cargo test
+```
+
+The repository also includes:
+
+- a `.devcontainer/` setup for containerized development
+- `.vscode/launch.json` and `.vscode/tasks.json` for local debugging/tasks
 
 ## Credits
 
-### Development Lead
+### tiagocoutinho/modbus-proxy-rs
 
-* Tiago Coutinho <coutinhotiago@gmail.com>
+- Tiago Coutinho <coutinhotiago@gmail.com>
+
+From which this repository is forked.
 
 ### Contributors
 
-* @dominikandreas
+- @dominikandreas
 
-[rust]: https://www.rust-lang.org/
-[python]: https://python.org/
 [modbus-proxy-py]: https://github.com/tiagocoutinho/modbus-proxy
-[tokio]: https://tokio.rs/
