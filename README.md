@@ -1,18 +1,39 @@
 # Modbus TCP proxy
 
-This repo is a fork of [`tiagocoutinho/modbus-proxy-rs`](https://github.com/tiagocoutinho/modbus-proxy-rs) that I tried to improve purely via agentic coding (all gemini 3.1 pro medium thinking).
+`modbus-proxy-rs` is a Modbus TCP layer 7 reverse proxy. It lets multiple
+clients talk to Modbus devices that only support a single client, or a very
+small number of concurrent clients.
 
-In particular, the agent changed the following:
+## Quick start
+
+1. Download and extract the latest release for your platform.
+2. Create `modbus-config.yml`:
+
+```yaml
+devices:
+  - modbus:
+      url: plc1.acme.org:502
+    listen:
+      bind: 0.0.0.0:9000
+```
+
+3. Run `./modbus-proxy-rs -c ./modbus-config.yml` and point your clients to `localhost:9000`.
+
+-----
+
+This repo is a fork of [`tiagocoutinho/modbus-proxy-rs`](https://github.com/tiagocoutinho/modbus-proxy-rs) that I tried to improve purely via agentic coding (all gemini 3.1 pro medium thinking, with a few "extend", "test", "review", "fix/improve" iterations).
+
+Note:
+> The changes in this fork have only been verified via manual and automatic testing. I did not read the code myself. Use at your own risk.
+
+Changes in this fork:
 
 - Safer proxying with transaction ID checks, backend timeouts, reconnects, and better error logging.
 - New Test Suite for mismatches, timeouts, and multiplexed concurrency.
 - More detailed connection and traffic logs.
 - Project polish: release workflow, and local devcontainer/editor setup, license
 
-`modbus-proxy-rs` is a Modbus TCP layer 7 reverse proxy. It lets multiple
-clients talk to Modbus devices that only support a single client, or a very
-small number of concurrent clients.
-
+-----
 
 ## Behavior
 
@@ -30,9 +51,52 @@ small number of concurrent clients.
 - Multiple configured devices run concurrently, each with its own listener and
   backend connection state.
 
-Compared with the upstream Rust fork, this branch also adds more detailed
-connection and traffic logging, async tests for the proxy behavior above, a
-license, release automation, and local development container/editor setup.
+## Installation
+
+### From git releases
+
+Download the archive that matches your platform from the
+[latest release](https://github.com/dominikandreas/modbus-proxy-rs/releases/latest):
+
+- `modbus-proxy-rs-x86_64-pc-windows-msvc.zip`: 64-bit Windows
+- `modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz`: most 64-bit Linux systems
+- `modbus-proxy-rs-x86_64-unknown-linux-musl.tar.gz`: static 64-bit Linux build
+- `modbus-proxy-rs-aarch64-unknown-linux-gnu.tar.gz`: ARM64 Linux
+- `modbus-proxy-rs-armv7-unknown-linux-gnueabihf.tar.gz`: 32-bit ARM Linux
+
+Each release also includes `SHA256SUMS.txt` for checksum verification.
+
+On Linux:
+
+```bash
+tar -xzf modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz
+cd modbus-proxy-rs-x86_64-unknown-linux-gnu
+./modbus-proxy-rs -c ./modbus-config.yml
+```
+
+On Windows PowerShell:
+
+```powershell
+Expand-Archive .\modbus-proxy-rs-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd .\modbus-proxy-rs-x86_64-pc-windows-msvc
+.\modbus-proxy-rs.exe -c .\modbus-config.yml
+```
+
+### from source
+
+Installation requrires the rust toolchain.
+
+Install from crates.io:
+
+```bash
+cargo install modbus-proxy-rs
+```
+
+Or build locally:
+
+```bash
+cargo build --release
+```
 
 
 ## Configuration
@@ -91,55 +155,6 @@ devices:
     listen:
       bind: 0.0.0.0:9001
 ```
-
-## Installation
-
-### From GitHub releases
-
-Download the archive that matches your platform from the
-[latest release](https://github.com/dominikandreas/modbus-proxy-rs/releases/latest):
-
-- `modbus-proxy-rs-x86_64-pc-windows-msvc.zip`: 64-bit Windows
-- `modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz`: most 64-bit Linux systems
-- `modbus-proxy-rs-x86_64-unknown-linux-musl.tar.gz`: static 64-bit Linux build
-- `modbus-proxy-rs-aarch64-unknown-linux-gnu.tar.gz`: ARM64 Linux
-- `modbus-proxy-rs-armv7-unknown-linux-gnueabihf.tar.gz`: 32-bit ARM Linux
-
-Each release also includes `SHA256SUMS.txt` for checksum verification.
-
-On Linux:
-
-```bash
-tar -xzf modbus-proxy-rs-x86_64-unknown-linux-gnu.tar.gz
-cd modbus-proxy-rs-x86_64-unknown-linux-gnu
-./modbus-proxy-rs -c ./modbus-config.yml
-```
-
-On Windows PowerShell:
-
-```powershell
-Expand-Archive .\modbus-proxy-rs-x86_64-pc-windows-msvc.zip -DestinationPath .
-cd .\modbus-proxy-rs-x86_64-pc-windows-msvc
-.\modbus-proxy-rs.exe -c .\modbus-config.yml
-```
-
-
-### From source
-
-Installation requires the Rust toolchain.
-
-Install from crates.io:
-
-```bash
-cargo install modbus-proxy-rs
-```
-
-Or build locally:
-
-```bash
-cargo build --release
-```
-
 
 ## Running
 
@@ -233,10 +248,9 @@ The repository also includes:
 
 - Tiago Coutinho <coutinhotiago@gmail.com>
 
-From which this repository is forked.
+From which this repository is forked. He implemented the original core logic, I only vibe coded on top.
 
 ### Contributors
 
-- @dominikandreas
-
-[modbus-proxy-py]: https://github.com/tiagocoutinho/modbus-proxy
+- [@dominikandreas](https://github.com/dominikandreas)
+- [@coutinhotiago](https://github.com/tiagocoutinho)
