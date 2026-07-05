@@ -13,6 +13,7 @@ small number of concurrent clients.
 devices:
   - modbus:
       url: plc1.acme.org:502
+      connect_delay_ms: 0
     listen:
       bind: 0.0.0.0:9000
 ```
@@ -107,6 +108,8 @@ The proxy reads its configuration from a file passed with `-c` /
 Each device entry needs:
 
 - `modbus.url`: the backend Modbus TCP device address
+- `modbus.connect_delay_ms`: optional delay after opening the backend TCP
+  connection and before forwarding the first request
 - `listen.bind`: the local listening address clients should connect to
 
 Configuration files can be written in YAML, TOML, or JSON.
@@ -117,9 +120,14 @@ Example in YAML:
 devices:
   - modbus:
       url: plc1.acme.org:502
+      connect_delay_ms: 0
     listen:
       bind: 0.0.0.0:9000
 ```
+
+Some devices accept TCP connections before their Modbus endpoint is ready for
+the first request. Set `connect_delay_ms` to wait after connecting to the
+backend. Huawei SUN2000 dongles commonly need around `2000`.
 
 Example in TOML:
 

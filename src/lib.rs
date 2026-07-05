@@ -42,9 +42,19 @@ fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
     (BufReader::new(reader), writer)
 }
 
-async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
+async fn create_connection(
+    url: &str,
+    connect_delay: std::time::Duration,
+) -> Result<(TcpReader, TcpWriter)> {
     let stream = TcpStream::connect(url).await?;
     stream.set_nodelay(true)?;
+    if !connect_delay.is_zero() {
+        debug!(
+            "Waiting {:?} after connecting to backend {}",
+            connect_delay, url
+        );
+        tokio::time::sleep(connect_delay).await;
+    }
     Ok(split_connection(stream))
 }
 
@@ -67,25 +77,33 @@ struct Listen {
 #[derive(Debug, Deserialize)]
 struct Modbus {
     url: String,
+    #[serde(default)]
+    connect_delay_ms: u64,
 }
 
 struct Device {
     url: String,
+    connect_delay: std::time::Duration,
     stream: Option<(TcpReader, TcpWriter)>,
 }
 
 impl Device {
-    pub fn new(url: &str) -> Device {
+    pub fn new(url: &str, connect_delay_ms: u64) -> Device {
         Device {
             url: url.to_string(),
+            connect_delay: std::time::Duration::from_millis(connect_delay_ms),
             stream: None,
         }
     }
 
     async fn connect(&mut self) -> Result<()> {
-        match create_connection(&self.url).await {
+        match create_connection(&self.url, self.connect_delay).await {
             Ok(connection) => {
-                info!("modbus connection to {} successful", self.url);
+                info!(
+                    "modbus connection to {} successful (connect_delay_ms = {})",
+                    self.url,
+                    self.connect_delay.as_millis()
+                );
                 debug!("Established backend TCP connection to {}", self.url);
                 self.stream = Some(connection);
                 Ok(())
@@ -108,13 +126,23 @@ impl Device {
 
     async fn raw_write_read(&mut self, frame: &Frame) -> Result<Frame> {
         let (reader, writer) = self.stream.as_mut().ok_or("no modbus connection")?;
-        trace!("Writing {} bytes to backend {}: {:02X?}", frame.len(), self.url, frame);
+        trace!(
+            "Writing {} bytes to backend {}: {:02X?}",
+            frame.len(),
+            self.url,
+            frame
+        );
         writer.write_all(&frame).await?;
         // No flush needed for TcpStream half
         let request_id = &frame[0..2];
         let timeout = std::time::Duration::from_secs(5);
         let reply = tokio::time::timeout(timeout, read_frame(reader)).await??;
-        trace!("Read {} bytes from backend {}: {:02X?}", reply.len(), self.url, reply);
+        trace!(
+            "Read {} bytes from backend {}: {:02X?}",
+            reply.len(),
+            self.url,
+            reply
+        );
         if &reply[0..2] != request_id {
             return Err(format!(
                 "transaction ID mismatch: expected {:?}, got {:?}",
@@ -180,8 +208,8 @@ impl Device {
         }
     }
 
-    async fn launch(url: &str, channel: &mut ChannelRx) {
-        let mut modbus = Self::new(url);
+    async fn launch(url: &str, connect_delay_ms: u64, channel: &mut ChannelRx) {
+        let mut modbus = Self::new(url, connect_delay_ms);
         modbus.run(channel).await;
     }
 }
@@ -196,13 +224,14 @@ impl Bridge {
     pub async fn run(&mut self) {
         let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
         let modbus_url = self.modbus.url.clone();
+        let connect_delay_ms = self.modbus.connect_delay_ms;
         let (tx, mut rx) = mpsc::channel::<Message>(32);
         tokio::spawn(async move {
-            Device::launch(&modbus_url, &mut rx).await;
+            Device::launch(&modbus_url, connect_delay_ms, &mut rx).await;
         });
         info!(
-            "Ready to accept requests on {} to {}",
-            &self.listen.bind, &self.modbus.url
+            "Ready to accept requests on {} to {} (connect_delay_ms = {})",
+            &self.listen.bind, &self.modbus.url, connect_delay_ms
         );
         loop {
             let (client, addr) = listener.accept().await.unwrap();
@@ -221,7 +250,7 @@ impl Bridge {
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "unknown".to_string());
-        
+
         debug!("Client {} stream setup", peer_addr);
         client.set_nodelay(true)?;
         channel.send(Message::Connection).await?;
@@ -237,11 +266,21 @@ impl Bridge {
     async fn client_loop(client: TcpStream, channel: &ChannelTx, peer_addr: &str) -> Result<()> {
         let (mut reader, mut writer) = split_connection(client);
         while let Ok(buf) = read_frame(&mut reader).await {
-            debug!("Received request from client {}: {:02X?} ({} bytes)", peer_addr, &buf[..], buf.len());
+            debug!(
+                "Received request from client {}: {:02X?} ({} bytes)",
+                peer_addr,
+                &buf[..],
+                buf.len()
+            );
             let (tx, rx) = oneshot::channel();
             channel.send(Message::Packet(buf, tx)).await?;
             let reply = rx.await?;
-            debug!("Sending reply to client {}: {:02X?} ({} bytes)", peer_addr, &reply[..], reply.len());
+            debug!(
+                "Sending reply to client {}: {:02X?} ({} bytes)",
+                peer_addr,
+                &reply[..],
+                reply.len()
+            );
             writer.write_all(&reply).await?;
         }
         Ok(())
@@ -301,7 +340,7 @@ mod tests {
     fn test_frame_size_logic() {
         let valid_header = [0x00, 0x01, 0x00, 0x00, 0x00, 0x05];
         assert_eq!(frame_size(&valid_header).unwrap(), 5);
-        
+
         let large_header = [0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF];
         assert_eq!(frame_size(&large_header).unwrap(), 65535);
     }
@@ -317,21 +356,29 @@ mod tests {
             let _ = stream.read_exact(&mut buf).await;
 
             // Send reply with a WRONG transaction ID (0x99, 0x99) instead of (0x00, 0x01)
-            let wrong_reply: Frame = vec![0x99, 0x99, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00];
+            let wrong_reply: Frame = vec![
+                0x99, 0x99, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00,
+            ];
             let _ = stream.write_all(&wrong_reply).await;
         });
 
-        let mut device = Device::new(&addr.to_string());
+        let mut device = Device::new(&addr.to_string(), 0);
         device.connect().await.unwrap();
 
         // Request with transaction ID 0x00 0x01
-        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
-        
+        let request_frame: Frame = vec![
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+
         let result = device.raw_write_read(&request_frame).await;
-        
+
         if result.is_err() {
             let err_msg = result.err().unwrap().to_string();
-            assert!(err_msg.contains("transaction ID mismatch"), "Incorrect err: {}", err_msg);
+            assert!(
+                err_msg.contains("transaction ID mismatch"),
+                "Incorrect err: {}",
+                err_msg
+            );
         } else {
             panic!("Expected an error, but got success: {:?}", result);
         }
@@ -348,15 +395,19 @@ mod tests {
             let _ = stream.read_exact(&mut buf).await;
 
             // Send reply with CORRECT transaction ID (0x00, 0x01)
-            let valid_reply: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00];
+            let valid_reply: Frame = vec![
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00,
+            ];
             let _ = stream.write_all(&valid_reply).await;
         });
 
-        let mut device = Device::new(&addr.to_string());
+        let mut device = Device::new(&addr.to_string(), 0);
         device.connect().await.unwrap();
 
-        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
-        
+        let request_frame: Frame = vec![
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+
         let result = device.raw_write_read(&request_frame).await;
         assert!(result.is_ok(), "Expected success, got {:?}", result);
         let reply = result.unwrap();
@@ -372,23 +423,29 @@ mod tests {
             let (mut stream, _) = mock_listener.accept().await.unwrap();
             let mut buf = vec![0u8; 12];
             let _ = stream.read_exact(&mut buf).await;
-            
+
             // Hang indefinitely instead of replying
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         });
 
-        let mut device = Device::new(&addr.to_string());
+        let mut device = Device::new(&addr.to_string(), 0);
         device.connect().await.unwrap();
 
-        let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
-        
+        let request_frame: Frame = vec![
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+
         let start_time = std::time::Instant::now();
         let result = device.raw_write_read(&request_frame).await;
         let elapsed = start_time.elapsed();
-        
+
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("deadline has elapsed") || err_msg.contains("timeout"), "Got msg: {}", err_msg);
+        assert!(
+            err_msg.contains("deadline has elapsed") || err_msg.contains("timeout"),
+            "Got msg: {}",
+            err_msg
+        );
         assert!(elapsed.as_secs() >= 4, "Should have taken 5s timeout");
     }
 
@@ -410,34 +467,81 @@ mod tests {
             }
         });
 
-        // Launch the internal device channel multiplexer 
+        // Launch the internal device channel multiplexer
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);
         tokio::spawn(async move {
-            Device::launch(&addr.to_string(), &mut rx).await;
+            Device::launch(&addr.to_string(), 0, &mut rx).await;
         });
 
         // Client 1 sends a request with Transaction ID (0x00, 0x01)
         let tx1 = tx.clone();
         let client1 = tokio::spawn(async move {
-            let request_frame: Frame = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+            let request_frame: Frame = vec![
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+            ];
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx1.send(Message::Packet(request_frame, reply_tx)).await.unwrap();
+            tx1.send(Message::Packet(request_frame, reply_tx))
+                .await
+                .unwrap();
             let reply = reply_rx.await.unwrap();
-            assert_eq!(reply[0..2], [0x00, 0x01], "Client 1 got wrong Transaction ID");
+            assert_eq!(
+                reply[0..2],
+                [0x00, 0x01],
+                "Client 1 got wrong Transaction ID"
+            );
         });
 
         // Client 2 concurrently sends a request with Transaction ID (0x00, 0x02)
         let tx2 = tx.clone();
         let client2 = tokio::spawn(async move {
-            let request_frame: Frame = vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01];
+            let request_frame: Frame = vec![
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+            ];
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            tx2.send(Message::Packet(request_frame, reply_tx)).await.unwrap();
+            tx2.send(Message::Packet(request_frame, reply_tx))
+                .await
+                .unwrap();
             let reply = reply_rx.await.unwrap();
-            assert_eq!(reply[0..2], [0x00, 0x02], "Client 2 got wrong Transaction ID");
+            assert_eq!(
+                reply[0..2],
+                [0x00, 0x02],
+                "Client 2 got wrong Transaction ID"
+            );
         });
 
-        // Join both client tasks; they should both smoothly succeed 
-        // through the exact same backend device connection 
+        // Join both client tasks; they should both smoothly succeed
+        // through the exact same backend device connection
         tokio::try_join!(client1, client2).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_delay_waits_before_first_backend_request() {
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = mock_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
+            let connected_at = std::time::Instant::now();
+            let mut buf = vec![0u8; 12];
+            let _ = stream.read_exact(&mut buf).await;
+            assert!(
+                connected_at.elapsed() >= std::time::Duration::from_millis(100),
+                "backend request arrived before configured connect delay"
+            );
+            let valid_reply: Frame = vec![
+                0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00,
+            ];
+            let _ = stream.write_all(&valid_reply).await;
+        });
+
+        let mut device = Device::new(&addr.to_string(), 100);
+        device.connect().await.unwrap();
+
+        let request_frame: Frame = vec![
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+
+        let reply = device.raw_write_read(&request_frame).await.unwrap();
+        assert_eq!(reply[0..2], request_frame[0..2]);
     }
 }
